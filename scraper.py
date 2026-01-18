@@ -5,13 +5,15 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import re
 import time
 import random
 from datetime import datetime
 from typing import Optional, List, Dict
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, quote, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -54,7 +56,7 @@ HEADERS = {
 }
 
 
-def get_page(url: str) -> BeautifulSoup | None:
+def get_page(url: str) -> Optional[BeautifulSoup]:
     """获取页面内容并解析为BeautifulSoup对象"""
     try:
         print(f"  正在访问: {url}")
@@ -72,7 +74,7 @@ def delay():
     time.sleep(random.uniform(1, 2))
 
 
-def parse_date_from_url(url: str) -> datetime | None:
+def parse_date_from_url(url: str) -> Optional[datetime]:
     """从URL中提取日期（格式: /年/月/文章名.html）"""
     match = re.search(r"/(\d{4})/(\d{2})/", url)
     if match:
@@ -81,11 +83,43 @@ def parse_date_from_url(url: str) -> datetime | None:
     return None
 
 
-def is_in_year_range(date: datetime | None) -> bool:
+def is_in_year_range(date: Optional[datetime]) -> bool:
     """检查日期是否在目标年份范围内"""
     if date is None:
         return False
     return YEAR_RANGE[0] <= date.year <= YEAR_RANGE[1]
+
+
+def normalize_url(url: str) -> str:
+    parts = urlsplit(url.strip())
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = quote(unquote(parts.path), safe="/~%:@!$&'()*+,;=")
+    query = quote(unquote(parts.query), safe="=&%")
+    fragment = quote(unquote(parts.fragment), safe="")
+    return urlunsplit((scheme, netloc, path, query, fragment))
+
+
+def read_existing_article_urls(output_dir: str) -> set[str]:
+    urls: set[str] = set()
+    if not os.path.isdir(output_dir):
+        return urls
+    for name in os.listdir(output_dir):
+        if not name.endswith(".md"):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r"^- 链接：(.*)$", text, flags=re.M)
+        if not m:
+            continue
+        url = m.group(1).strip()
+        if url:
+            urls.add(normalize_url(url))
+    return urls
 
 
 def get_articles_from_label_page(label: str, label_url: str) -> list[dict]:
@@ -144,7 +178,7 @@ def get_articles_from_label_page(label: str, label_url: str) -> list[dict]:
     return articles
 
 
-def extract_article_content(url: str) -> dict | None:
+def extract_article_content(url: str) -> Optional[dict]:
     """从文章页面提取完整内容"""
     soup = get_page(url)
     if not soup:
@@ -336,15 +370,100 @@ def get_articles_from_search(keyword: str) -> list[dict]:
     return articles
 
 
+def load_backfill_items_from_audit_json(path: str) -> list[dict]:
+    """
+    读取 audit_collection.py 生成的 audit_missing.json，
+    返回形如 {url, published, labels} 的列表。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    items: list[dict] = []
+    for x in obj.get("missing", []):
+        url = (x.get("url") or "").strip()
+        published = (x.get("published") or "").strip()
+        labels = x.get("labels") or []
+        if not url:
+            continue
+        items.append({"url": url, "published": published, "labels": labels})
+    return items
+
+
+def backfill_from_audit(audit_json_path: str, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+    existing_urls = read_existing_article_urls(output_dir)
+
+    items = load_backfill_items_from_audit_json(audit_json_path)
+    if not items:
+        print("未在 audit json 中找到 missing 列表，程序退出")
+        return
+
+    print(f"待补抓 {len(items)} 篇（本地已存在 {len(existing_urls)} 篇，按 URL 去重跳过）")
+    saved_count = 0
+
+    for i, item in enumerate(items, 1):
+        url = normalize_url(item["url"])
+        if url in existing_urls:
+            print(f"\n[{i}/{len(items)}] 跳过已存在: {url}")
+            continue
+
+        print(f"\n[{i}/{len(items)}] 补抓: {url}")
+        full_article = extract_article_content(url)
+        if not full_article:
+            delay()
+            continue
+
+        feed_published = None
+        if item.get("published"):
+            try:
+                feed_published = datetime.strptime(item["published"], "%Y-%m-%d")
+            except ValueError:
+                feed_published = None
+
+        if not full_article.get("date") and feed_published:
+            full_article["date"] = feed_published
+        elif full_article.get("date") and feed_published:
+            if getattr(full_article["date"], "day", None) == 1 and feed_published.day != 1:
+                full_article["date"] = feed_published
+
+        labels = list(full_article.get("labels", []))
+        for lbl in item.get("labels", []) or []:
+            if lbl and lbl not in labels:
+                labels.append(lbl)
+        if "补抓" not in labels:
+            labels.append("补抓")
+        full_article["labels"] = labels
+
+        save_article_to_markdown(full_article, output_dir)
+        existing_urls.add(url)
+        saved_count += 1
+        delay()
+
+    print(f"\n补抓完成！共新增保存 {saved_count} 篇文章到 {output_dir}/ 目录")
+
+
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description="槽边往事博客爬虫")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument(
+        "--backfill-audit-json",
+        default=None,
+        help="audit_collection.py 生成的 audit_missing.json 路径（读取 missing 列表并补抓）",
+    )
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+
+    if args.backfill_audit_json:
+        return backfill_from_audit(args.backfill_audit_json, output_dir)
+
     print("=" * 60)
     print("槽边往事博客爬虫 - 推荐类文章")
     print(f"筛选年份: {YEAR_RANGE[0]} - {YEAR_RANGE[1]}")
     print("=" * 60)
 
     # 创建输出目录
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # 收集所有文章链接
     all_articles = []
@@ -410,13 +529,13 @@ def main():
             if not full_article.get("date"):
                 full_article["date"] = article["date"]
 
-            save_article_to_markdown(full_article, OUTPUT_DIR)
+            save_article_to_markdown(full_article, output_dir)
             saved_count += 1
 
         delay()
 
     print("\n" + "=" * 60)
-    print(f"爬取完成！共保存 {saved_count} 篇文章到 {OUTPUT_DIR}/ 目录")
+    print(f"爬取完成！共保存 {saved_count} 篇文章到 {output_dir}/ 目录")
     print("=" * 60)
 
 
